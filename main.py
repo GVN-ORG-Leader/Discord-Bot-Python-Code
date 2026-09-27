@@ -54,6 +54,7 @@ coupons = {}
 proof_settings = {}        # 実績通知設定 {v_id: {"channel_id": int, "type": str}}
 stock_add_settings = {}    # 在庫追加通知設定 {v_id: {"channel_id": int}}
 purchase_role_settings = {} # 購入ロール設定 {v_id: [{"role_id": int, "type": str, "item_id": str, "deadline": str}]}
+verify_panels = {}         # 設置済み認証パネル {role_id(str): {"label": str}}
 paypay_client = None
 
 # --- MongoDB 保存・復元関数 ---
@@ -67,7 +68,8 @@ def save_to_db():
         "coupons": coupons,
         "proof_settings": proof_settings,
         "stock_add_settings": stock_add_settings,
-        "purchase_role_settings": purchase_role_settings
+        "purchase_role_settings": purchase_role_settings,
+        "verify_panels": verify_panels
     }
     try:
         data_collection.replace_one({"_id": "main_data"}, data, upsert=True)
@@ -76,7 +78,7 @@ def save_to_db():
 
 def load_from_db():
     """MongoDB から全データを復元"""
-    global vending_machines, coupons, proof_settings, stock_add_settings, purchase_role_settings
+    global vending_machines, coupons, proof_settings, stock_add_settings, purchase_role_settings, verify_panels
     if data_collection is None:
         return
     try:
@@ -92,6 +94,8 @@ def load_from_db():
             stock_add_settings.update(data.get("stock_add_settings", {}))
             purchase_role_settings.clear()
             purchase_role_settings.update(data.get("purchase_role_settings", {}))
+            verify_panels.clear()
+            verify_panels.update(data.get("verify_panels", {}))
             print("MongoDB からデータを正常に復元しました。")
     except Exception as e:
         print(f"MongoDB 復元エラー: {e}")
@@ -803,8 +807,23 @@ class VendingView(discord.ui.View):
         super().__init__(timeout=None)
         self.vending_machine_id = vending_machine_id
 
-    @discord.ui.button(label="🛒購入する", style=discord.ButtonStyle.success, custom_id="vending_buy_btn")
-    async def buy_cb(self, interaction: discord.Interaction, button: discord.ui.Button):
+        buy_btn = discord.ui.Button(
+            label="🛒購入する",
+            style=discord.ButtonStyle.success,
+            custom_id=f"vending_buy_btn:{vending_machine_id}"
+        )
+        buy_btn.callback = self.buy_cb
+        self.add_item(buy_btn)
+
+        stock_btn = discord.ui.Button(
+            label="在庫確認",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"vending_stock_btn:{vending_machine_id}"
+        )
+        stock_btn.callback = self.stock_cb
+        self.add_item(stock_btn)
+
+    async def buy_cb(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
         vm_data = vending_machines.get(self.vending_machine_id)
@@ -830,8 +849,7 @@ class VendingView(discord.ui.View):
         item_view.add_item(select)
         await interaction.followup.send("商品を選択してください", view=item_view, ephemeral=True)
 
-    @discord.ui.button(label="在庫確認", style=discord.ButtonStyle.danger, custom_id="vending_stock_btn")
-    async def stock_cb(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def stock_cb(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
         vm_data = vending_machines.get(self.vending_machine_id)
@@ -931,7 +949,8 @@ async def save_cmd(interaction: discord.Interaction):
         "coupons": coupons,
         "proof_settings": proof_settings,
         "stock_add_settings": stock_add_settings,
-        "purchase_role_settings": purchase_role_settings
+        "purchase_role_settings": purchase_role_settings,
+        "verify_panels": verify_panels
     }
     json_str = json.dumps(data, ensure_ascii=False)
     output_text = f"`{json_str}`"
@@ -955,7 +974,7 @@ async def save_cmd(interaction: discord.Interaction):
     file="セーブ時に出力された .json ファイルを添付"
 )
 async def load_cmd(interaction: discord.Interaction, data_text: str = None, file: discord.Attachment = None):
-    global vending_machines, coupons, proof_settings, stock_add_settings, purchase_role_settings
+    global vending_machines, coupons, proof_settings, stock_add_settings, purchase_role_settings, verify_panels
     
     if not data_text and not file:
         await interaction.response.send_message("❌ テキストを入力するか、.json ファイルを添付してください。", ephemeral=True)
@@ -991,6 +1010,8 @@ async def load_cmd(interaction: discord.Interaction, data_text: str = None, file
             stock_add_settings.update(data.get("stock_add_settings", {}))
             purchase_role_settings.clear()
             purchase_role_settings.update(data.get("purchase_role_settings", {}))
+            verify_panels.clear()
+            verify_panels.update(data.get("verify_panels", {}))
         else:
             vending_machines.clear()
             vending_machines.update(data)
@@ -1006,6 +1027,22 @@ async def on_ready():
     global paypay_client
 
     load_from_db()
+
+    # --- 再起動後もボタンが反応するように、永続Viewを再登録 ---
+    bot.add_view(TicketView(label="📩┋チケットを作成", button_color="#5865F2"))
+    bot.add_view(TicketCloseView())
+
+    for role_id_str, panel_data in verify_panels.items():
+        try:
+            bot.add_view(VerifyView(int(role_id_str), panel_data.get("label", "✅┋認証する")))
+        except Exception as e:
+            print(f"認証パネルの再登録に失敗しました (role_id={role_id_str}): {e}")
+
+    for v_id in vending_machines.keys():
+        try:
+            bot.add_view(VendingView(v_id))
+        except Exception as e:
+            print(f"自販機パネルの再登録に失敗しました (vending_machine_id={v_id}): {e}")
 
     saved_data = load_tokens()
     if saved_data and saved_data.get("refresh_token"):
@@ -1077,6 +1114,10 @@ async def verify_cmd(
 
     view = VerifyView(role.id, final_label)
     await interaction.channel.send(embed=embed, view=view)
+
+    verify_panels[str(role.id)] = {"label": final_label}
+    save_to_db()
+
     await interaction.response.send_message("認証パネルを設置しました。", ephemeral=True)
 
 @bot.tree.command(name="paypay_login", description="PayPayにログインします（初回のみ1度だけ実行してください）")
