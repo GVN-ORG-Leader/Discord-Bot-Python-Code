@@ -1010,25 +1010,22 @@ async def load_cmd(interaction: discord.Interaction, data_text: str = None, file
             stock_add_settings.update(data.get("stock_add_settings", {}))
             purchase_role_settings.clear()
             purchase_role_settings.update(data.get("purchase_role_settings", {}))
-            verify_panels.clear()
-            verify_panels.update(data.get("verify_panels", {}))
+            if "verify_panels" in data:
+                verify_panels.clear()
+                verify_panels.update(data["verify_panels"])
         else:
             vending_machines.clear()
             vending_machines.update(data)
 
+        register_persistent_views()
         save_to_db()
         await interaction.response.send_message("✅ データを正常に復元（ロード）しクラウドに保存しました！", ephemeral=True)
 
     except Exception as e:
         await interaction.response.send_message(f"❌ データのロードに失敗しました。ファイルの内容またはテキスト列が正しいか確認してください。\n詳細: `{e}`", ephemeral=True)
 
-@bot.event
-async def on_ready():
-    global paypay_client
-
-    load_from_db()
-
-    # --- 再起動後もボタンが反応するように、永続Viewを再登録 ---
+def register_persistent_views():
+    """再起動後・/load後もボタンが反応するように永続Viewを(再)登録する"""
     bot.add_view(TicketView(label="📩┋チケットを作成", button_color="#5865F2"))
     bot.add_view(TicketCloseView())
 
@@ -1038,11 +1035,19 @@ async def on_ready():
         except Exception as e:
             print(f"認証パネルの再登録に失敗しました (role_id={role_id_str}): {e}")
 
-    for v_id in vending_machines.keys():
+    for v_id in list(vending_machines.keys()):
         try:
             bot.add_view(VendingView(v_id))
         except Exception as e:
             print(f"自販機パネルの再登録に失敗しました (vending_machine_id={v_id}): {e}")
+
+@bot.event
+async def on_ready():
+    global paypay_client
+
+    load_from_db()
+
+    register_persistent_views()
 
     saved_data = load_tokens()
     if saved_data and saved_data.get("refresh_token"):
