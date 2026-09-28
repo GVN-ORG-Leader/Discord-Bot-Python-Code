@@ -824,6 +824,20 @@ class VendingView(discord.ui.View):
         self.add_item(stock_btn)
 
     async def buy_cb(self, interaction: discord.Interaction):
+        print(f"[VENDING] buy_cb 開始 machine={self.vending_machine_id}")
+        try:
+            await self._buy_impl(interaction)
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(f"❌ エラー: `{e}`", ephemeral=True)
+                else:
+                    await interaction.response.send_message(f"❌ エラー: `{e}`", ephemeral=True)
+            except Exception:
+                pass
+
+    async def _buy_impl(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
         vm_data = vending_machines.get(self.vending_machine_id)
@@ -1023,6 +1037,16 @@ async def load_cmd(interaction: discord.Interaction, data_text: str = None, file
 
     except Exception as e:
         await interaction.response.send_message(f"❌ データのロードに失敗しました。ファイルの内容またはテキスト列が正しいか確認してください。\n詳細: `{e}`", ephemeral=True)
+
+@bot.event
+async def on_interaction(interaction: discord.Interaction):
+    # 診断用: ボタン/セレクトが押されたことをログに出す(処理自体は従来どおり継続)
+    try:
+        cid = (interaction.data or {}).get("custom_id")
+        if cid:
+            print(f"[INTERACTION] type={interaction.type.name} custom_id={cid} user={interaction.user.id} guild={interaction.guild_id}")
+    except Exception as e:
+        print(f"[INTERACTION] log error: {e}")
 
 def register_persistent_views():
     """再起動後・/load後もボタンが反応するように永続Viewを(再)登録する"""
