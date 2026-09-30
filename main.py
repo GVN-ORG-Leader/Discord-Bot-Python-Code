@@ -49,6 +49,21 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+def safe_emoji(value):
+    """空文字や不正な値が discord.SelectOption(emoji=...) に渡って
+    'Invalid emoji' エラーになるのを防ぐ。有効な文字列だけ通す。"""
+    if not value or not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        discord.PartialEmoji.from_str(value)
+    except Exception:
+        return None
+    return value
+
+
 vending_machines = {}
 coupons = {}
 proof_settings = {}        # 実績通知設定 {v_id: {"channel_id": int, "type": str}}
@@ -759,7 +774,7 @@ class EditItemSelect(discord.ui.Select):
         self.v_id = v_id
         items = vending_machines[v_id]["items"]
         options = [
-            discord.SelectOption(label=data["name"], value=i_id, emoji=data.get("emoji"))
+            discord.SelectOption(label=data["name"], value=i_id, emoji=safe_emoji(data.get("emoji")))
             for i_id, data in items.items()
         ]
         super().__init__(placeholder="内容を変更する商品を選択してください", min_values=1, max_values=1, options=options)
@@ -774,7 +789,7 @@ class DeleteItemSelect(discord.ui.Select):
         self.v_id = v_id
         items = vending_machines[v_id]["items"]
         options = [
-            discord.SelectOption(label=data["name"], value=i_id, emoji=data.get("emoji"))
+            discord.SelectOption(label=data["name"], value=i_id, emoji=safe_emoji(data.get("emoji")))
             for i_id, data in items.items()
         ]
         super().__init__(placeholder="削除する商品を選択してください", min_values=1, max_values=1, options=options)
@@ -846,7 +861,7 @@ class VendingView(discord.ui.View):
             return
 
         options = [
-            discord.SelectOption(label=data["name"], value=i_id, emoji=data.get("emoji"))
+            discord.SelectOption(label=data["name"], value=i_id, emoji=safe_emoji(data.get("emoji")))
             for i_id, data in vm_data["items"].items()
         ]
 
