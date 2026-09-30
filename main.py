@@ -312,6 +312,8 @@ class MainHelpSelect(discord.ui.Select):
                             "・`/在庫追加 <vending_machine_id>` : 商品に在庫を追加します。\n"
                             "  ※ `{内容}` でインラインコード枠、`{{内容}}` でコードブロック。\n"
                             "  ※ 改行したい場所には `\\n` を入力してください。\n"
+                            "・`/file在庫追加 <vending_machine_id> <merchandise> <file> <type>` : テキストファイルから在庫を追加します。\n"
+                            "  ※ 有限: 1行=在庫1個 / 無限: ファイル全体を1つの在庫にします。\n"
                             "・`/在庫内容確認 <vending_machine_id>` : 全在庫を出力します。\n"
                             "・`/在庫引出 <vending_machine_id> <quantity>` : 在庫を指定数引き出します。",
                 color=discord.Color.orange()
@@ -409,6 +411,16 @@ async def vending_machine_autocomplete(interaction: discord.Interaction, current
         if current.lower() in data["name"].lower()
     ][:25]
 
+async def merchandise_autocomplete(interaction: discord.Interaction, current: str):
+    """直前に選択した vending_machine_id の商品だけを候補に出す"""
+    v_id = getattr(interaction.namespace, "vending_machine_id", None)
+    items = vending_machines.get(v_id, {}).get("items", {}) if v_id else {}
+    return [
+        app_commands.Choice(name=str(data["name"])[:100], value=i_id)
+        for i_id, data in items.items()
+        if current.lower() in str(data["name"]).lower()
+    ][:25]
+
 async def coupon_autocomplete(interaction: discord.Interaction, current: str):
     return [
         app_commands.Choice(name=code, value=code)
@@ -432,18 +444,8 @@ async def deliver_items_to_dm(interaction: discord.Interaction, v_id: str, item_
 
     item["sold_count"] = item.get("sold_count", 0) + qty
 
-    # --- DB保存 & Text.json ファイルへ自動出力 ---
+    # --- DB保存 ---
     save_to_db()
-
-    export_data = {
-        "vending_machines": vending_machines,
-        "coupons": coupons,
-        "proof_settings": proof_settings,
-        "stock_add_settings": stock_add_settings,
-        "purchase_role_settings": purchase_role_settings
-    }
-    with open("Text.json", "w", encoding="utf-8") as f:
-        json.dump(export_data, f, ensure_ascii=False, indent=2)
 
     raw_stock_content = ""
     for d in drawn:
@@ -462,10 +464,6 @@ async def deliver_items_to_dm(interaction: discord.Interaction, v_id: str, item_
     try:
         # 購入者に商品を送信
         await interaction.user.send(embed=embed)
-
-        # 最新データの Text.json をDMへ送信
-        with open("Text.json", "rb") as f:
-            await interaction.user.send(content="📄 最新のバックアップデータです:", file=discord.File(f, "Text.json"))
 
         # 実績通知
         if v_id in proof_settings:
@@ -946,7 +944,7 @@ async def help_all_cmd(interaction: discord.Interaction):
     embed.add_field(name="✅ 認証機能", value="`/verify` : 認証パネル設置", inline=True)
     embed.add_field(name="💳 PayPay連携", value="`/paypay_login` : PayPay自動決済設定", inline=True)
     embed.add_field(name="🛒 自販機管理", value="`/自販機作成`, `/自販機設置` など", inline=True)
-    embed.add_field(name="📦 在庫管理", value="`/在庫追加`, `/在庫内容確認` など", inline=True)
+    embed.add_field(name="📦 在庫管理", value="`/在庫追加`, `/file在庫追加`, `/在庫内容確認` など", inline=True)
     embed.add_field(name="🏷️ クーポン管理", value="`/クーポン作成`, `/クーポン一覧` など", inline=True)
     embed.add_field(name="💾 セーブ/ロード", value="`/save`, `/load` でデータを保管", inline=True)
     embed.add_field(name="🧹 メッセージ削除", value="`/clear` : チャンネルメッセージ削除", inline=True)
@@ -1371,6 +1369,128 @@ async def add_stock(interaction: discord.Interaction, vending_machine_id: str):
     view = discord.ui.View(timeout=None)
     view.add_item(select)
     await interaction.response.send_message("商品を選択してください", view=view, ephemeral=True)
+
+MAX_STOCK_FILE_SIZE = 1 * 1024 * 1024   # 添付ファイルの上限 (1MB)
+MAX_STOCK_ENTRY_LEN = 1500              # 在庫1件あたりの上限文字数 (/在庫追加 のモーダルと同じ)
+
+@bot.tree.command(name="file在庫追加", description="添付したテキストファイルの内容を在庫として追加します")
+@app_commands.describe(
+    vending_machine_id="在庫を追加する自販機",
+    merchandise="在庫を追加する商品",
+    file="在庫にするテキストファイル(.txt)",
+    type="有限: 1行=在庫1個 / 無限: ファイル全体を1つの在庫として登録"
+)
+@app_commands.choices(type=[
+    app_commands.Choice(name="有限", value="有限"),
+    app_commands.Choice(name="無限", value="無限")
+])
+@app_commands.autocomplete(vending_machine_id=vending_machine_autocomplete, merchandise=merchandise_autocomplete)
+async def file_add_stock(
+    interaction: discord.Interaction,
+    vending_machine_id: str,
+    merchandise: str,
+    file: discord.Attachment,
+    type: str
+):
+    vm = vending_machines.get(vending_machine_id)
+    if not vm:
+        await interaction.response.send_message("指定された自販機が見つかりません。", ephemeral=True)
+        return
+
+    item = vm.get("items", {}).get(merchandise)
+    if not item:
+        await interaction.response.send_message("指定された商品が見つかりません。候補から選択してください。", ephemeral=True)
+        return
+
+    if item["type"] != type:
+        await interaction.response.send_message(
+            f"❌ 商品「{item['name']}」のタイプは「{item['type']}」です。type も「{item['type']}」を選択してください。\n"
+            f"(タイプを変えたい場合は `/商品内容変更` で変更してください)",
+            ephemeral=True
+        )
+        return
+
+    if file.size > MAX_STOCK_FILE_SIZE:
+        await interaction.response.send_message(
+            f"❌ ファイルが大きすぎます。({MAX_STOCK_FILE_SIZE // 1024 // 1024}MB以下にしてください)",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        raw = await file.read()
+    except Exception as e:
+        await interaction.followup.send(f"❌ ファイルの読み込みに失敗しました: `{e}`", ephemeral=True)
+        return
+
+    text = None
+    for enc in ("utf-8-sig", "cp932"):
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        await interaction.followup.send("❌ ファイルの文字コードを読み取れませんでした。テキストファイル(UTF-8)を添付してください。", ephemeral=True)
+        return
+
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    if type == "有限":
+        entries = [line.strip() for line in text.split("\n") if line.strip()]
+    else:
+        whole = text.strip()
+        entries = [whole] if whole else []
+
+    if not entries:
+        await interaction.followup.send("❌ ファイルに有効な内容がありません。", ephemeral=True)
+        return
+
+    too_long = [i for i, e in enumerate(entries, 1) if len(e) > MAX_STOCK_ENTRY_LEN]
+    if too_long:
+        target = "ファイル全体" if type == "無限" else f"{too_long[0]}件目"
+        await interaction.followup.send(
+            f"❌ 在庫1件あたりの上限は{MAX_STOCK_ENTRY_LEN}文字です。({target}が超過しています)",
+            ephemeral=True
+        )
+        return
+
+    if "stock_list" not in item:
+        item["stock_list"] = []
+
+    if type == "有限":
+        item["stock_list"].extend(entries)
+        result_text = f"✅ 「{item['name']}」に在庫を **{len(entries)}個** 追加しました。(現在在庫: {len(item['stock_list'])}個)"
+    else:
+        # 無限在庫は先頭の1件を繰り返し配布する仕様のため、内容を置き換える
+        item["stock_list"] = entries
+        result_text = f"✅ 「{item['name']}」の無限在庫の内容を登録しました。"
+
+    save_to_db()
+
+    preview = format_stock_item(entries[0])
+    if len(preview) > 500:
+        preview = preview[:500] + "..."
+    await interaction.followup.send(f"{result_text}\n購入時に送信される内容(先頭のみ):\n{preview}", ephemeral=True)
+
+    if vending_machine_id in stock_add_settings and interaction.guild:
+        try:
+            setting = stock_add_settings[vending_machine_id]
+            target_channel = interaction.guild.get_channel(setting["channel_id"])
+            if target_channel:
+                now_str = datetime.now(JST).strftime("%Y/%m/%d/%H:%M:%S.%f")[:-3]
+                add_desc = (
+                    f"**チャンネル**\n{interaction.channel.mention}\n"
+                    f"**自販機**\n```{vm['name']}```"
+                    f"**商品名**\n```{item['name']}```"
+                    f"**個数**\n```{len(entries) if type == '有限' else 1}```"
+                    f"**追加日**\n```{now_str}```"
+                )
+                await target_channel.send(embed=discord.Embed(description=add_desc, color=discord.Color.green()))
+        except Exception as e:
+            print(f"在庫追加通知の送信に失敗: {e}")
 
 @bot.tree.command(name="在庫内容確認", description="自販機内のすべての在庫を出力")
 @app_commands.describe(vending_machine_id="在庫の内容を確認する自販機")
