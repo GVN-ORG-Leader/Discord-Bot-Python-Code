@@ -312,8 +312,8 @@ class MainHelpSelect(discord.ui.Select):
                             "・`/在庫追加 <vending_machine_id>` : 商品に在庫を追加します。\n"
                             "  ※ `{内容}` でインラインコード枠、`{{内容}}` でコードブロック。\n"
                             "  ※ 改行したい場所には `\\n` を入力してください。\n"
-                            "・`/file在庫追加 <vending_machine_id> <merchandise> <file> <type>` : テキストファイルから在庫を追加します。\n"
-                            "  ※ 有限: 1行=在庫1個 / 無限: ファイル全体を1つの在庫にします。\n"
+                            "・`/file在庫追加 <vending_machine_id> <merchandise> <file>` : テキストファイルから在庫を追加します。\n"
+                            "  ※ 商品が有限なら1行=在庫1個、無限ならファイル全体を1つの在庫にします。\n"
                             "・`/在庫内容確認 <vending_machine_id>` : 全在庫を出力します。\n"
                             "・`/在庫引出 <vending_machine_id> <quantity>` : 在庫を指定数引き出します。",
                 color=discord.Color.orange()
@@ -1397,20 +1397,14 @@ MAX_STOCK_ENTRY_LEN = 1500              # 在庫1件あたりの上限文字数 
 @app_commands.describe(
     vending_machine_id="在庫を追加する自販機",
     merchandise="在庫を追加する商品",
-    file="在庫にするテキストファイル(.txt)",
-    type="有限: 1行=在庫1個 / 無限: ファイル全体を1つの在庫として登録"
+    file="在庫にするテキストファイル(.txt) ※有限: 1行=在庫1個 / 無限: ファイル全体を1つの在庫"
 )
-@app_commands.choices(type=[
-    app_commands.Choice(name="有限", value="有限"),
-    app_commands.Choice(name="無限", value="無限")
-])
 @app_commands.autocomplete(vending_machine_id=vending_machine_autocomplete, merchandise=merchandise_autocomplete)
 async def file_add_stock(
     interaction: discord.Interaction,
     vending_machine_id: str,
     merchandise: str,
-    file: discord.Attachment,
-    type: str
+    file: discord.Attachment
 ):
     vm = vending_machines.get(vending_machine_id)
     if not vm:
@@ -1422,13 +1416,7 @@ async def file_add_stock(
         await interaction.response.send_message("指定された商品が見つかりません。候補から選択してください。", ephemeral=True)
         return
 
-    if item["type"] != type:
-        await interaction.response.send_message(
-            f"❌ 商品「{item['name']}」のタイプは「{item['type']}」です。type も「{item['type']}」を選択してください。\n"
-            f"(タイプを変えたい場合は `/商品内容変更` で変更してください)",
-            ephemeral=True
-        )
-        return
+    type = item["type"]  # 有限/無限 は商品登録時の設定を使う
 
     if file.size > MAX_STOCK_FILE_SIZE:
         await interaction.response.send_message(
