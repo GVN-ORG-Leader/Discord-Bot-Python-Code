@@ -1729,9 +1729,10 @@ async def purchase_role_cmd(
 async def create_coupon(interaction: discord.Interaction, vending_machine_id: str, code: str, coupon: int):
     coupons[code] = {"vm_id": vending_machine_id, "amount": coupon}
     save_to_db()
+    vm_name = vending_machines.get(vending_machine_id, {}).get("name", "（不明な自販機）")
     await interaction.response.send_message(
         f"クーポンコード「{code}」を作成しました。\n"
-        f"利用可能自販機: `{vending_machine_id}`\n"
+        f"利用可能自販機: `{vm_name}`\n"
         f"クーポンコード: `{code}`\n"
         f"適用金額: `{coupon}`",
         ephemeral=True,
@@ -1745,8 +1746,9 @@ async def list_coupons(interaction: discord.Interaction):
 
     lines = []
     for code, data in coupons.items():
+        vm_name = vending_machines.get(data["vm_id"], {}).get("name", "（削除済みの自販機）")
         lines.append(
-            f"利用可能自販機: `{data['vm_id']}`\n"
+            f"利用可能自販機: `{vm_name}`\n"
             f"クーポンコード: `{code}`\n"
             f"適用金額: `{data['amount']}`"
         )
@@ -1762,9 +1764,10 @@ async def delete_coupon(interaction: discord.Interaction, code: str):
         return
 
     data = coupons[code]
+    vm_name = vending_machines.get(data["vm_id"], {}).get("name", "（削除済みの自販機）")
     embed = discord.Embed(title="本当に削除しますか？\nこの動作は取り消せません。", color=discord.Color.red())
     embed.description = (
-        f"利用可能自販機: `{data['vm_id']}`\n"
+        f"利用可能自販機: `{vm_name}`\n"
         f"クーポンコード: `{code}`\n"
         f"適用金額: `{data['amount']}`"
     )
