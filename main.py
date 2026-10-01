@@ -203,7 +203,7 @@ class TicketButton(discord.ui.Button):
 
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(read_messages=False),
-            user: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+            user: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True),
             guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)
         }
 
@@ -397,7 +397,7 @@ class MemberHelpSelect(discord.ui.Select):
                 color=discord.Color.red()
             ),
         }
-        await interaction.response.send_message(embed=embeds[val])
+        await interaction.response.send_message(embed=embeds[val], ephemeral=True)
 
 class MemberHelpView(discord.ui.View):
     def __init__(self):
@@ -436,6 +436,11 @@ async def deliver_items_to_dm(interaction: discord.Interaction, v_id: str, item_
 
     stock_list = item.get("stock_list", [])
 
+    if item["type"] == "有限" and len(stock_list) < qty:
+        await interaction.followup.send(f"在庫が足りません。(現在在庫: {len(stock_list)}個)", ephemeral=True)
+        return False
+
+    # 在庫を取り出す(DMの送信に失敗した場合は下の rollback_stock で元に戻す)
     if item["type"] == "有限":
         drawn = stock_list[:qty]
         item["stock_list"] = stock_list[qty:]
@@ -444,8 +449,11 @@ async def deliver_items_to_dm(interaction: discord.Interaction, v_id: str, item_
 
     item["sold_count"] = item.get("sold_count", 0) + qty
 
-    # --- DB保存 ---
-    save_to_db()
+    def rollback_stock():
+        if item["type"] == "有限":
+            item["stock_list"] = list(drawn) + item.get("stock_list", [])
+        item["sold_count"] = max(0, item.get("sold_count", 0) - qty)
+        save_to_db()
 
     raw_stock_content = ""
     for d in drawn:
@@ -461,10 +469,23 @@ async def deliver_items_to_dm(interaction: discord.Interaction, v_id: str, item_
         color=discord.Color.green()
     )
 
+    # 購入者に商品を送信(失敗したら在庫・売上数を元に戻す)
     try:
-        # 購入者に商品を送信
         await interaction.user.send(embed=embed)
+    except discord.Forbidden:
+        rollback_stock()
+        await interaction.followup.send("❌ DMの送信に失敗しました。DMの受取許可設定を確認してください。\n※在庫は減っていません。", ephemeral=True)
+        return False
+    except discord.HTTPException as e:
+        rollback_stock()
+        await interaction.followup.send(f"❌ 商品の送信に失敗しました: `{e}`\n※在庫は減っていません。", ephemeral=True)
+        return False
 
+    # DM送信成功 → 在庫減少を確定
+    save_to_db()
+
+    # 以降(実績通知・ロール付与)で失敗しても、商品は届いているので購入は成功扱い
+    try:
         # 実績通知
         if v_id in proof_settings:
             setting = proof_settings[v_id]
@@ -493,11 +514,10 @@ async def deliver_items_to_dm(interaction: discord.Interaction, v_id: str, item_
                     role = interaction.guild.get_role(p_setting["role_id"])
                     if role and isinstance(interaction.user, discord.Member):
                         await apply_purchase_role(interaction.user, role, p_setting.get("deadline"))
+    except Exception as e:
+        print(f"購入後処理(実績通知/ロール付与)でエラー: {e}")
 
-        return True
-    except discord.Forbidden:
-        await interaction.followup.send("❌ DMの送信に失敗しました。DMの受取許可設定を確認してください。", ephemeral=True)
-        return False
+    return True
 
 class PayPayConfirmView(discord.ui.View):
     def __init__(self, v_id: str, item_id: str, qty: int, paypay_url: str, passcode: str, sent_amount: int):
