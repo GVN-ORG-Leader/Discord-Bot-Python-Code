@@ -70,6 +70,8 @@ proof_settings = {}        # 実績通知設定 {v_id: {"channel_id": int, "type
 stock_add_settings = {}    # 在庫追加通知設定 {v_id: {"channel_id": int}}
 purchase_role_settings = {} # 購入ロール設定 {v_id: [{"role_id": int, "type": str, "item_id": str, "deadline": str}]}
 verify_panels = {}         # 設置済み認証パネル {role_id(str): {"label": str}}
+low_stock_settings = {}    # 低在庫通知設定 {v_id: {"channel_id": int, "threshold": int}}
+purchase_history = []      # 購入履歴 [{"user_id": int, "vm_name": str, "item_name": str, "qty": int, "at": str}]
 paypay_client = None
 
 # --- MongoDB 保存・復元関数 ---
@@ -84,7 +86,9 @@ def save_to_db():
         "proof_settings": proof_settings,
         "stock_add_settings": stock_add_settings,
         "purchase_role_settings": purchase_role_settings,
-        "verify_panels": verify_panels
+        "verify_panels": verify_panels,
+        "low_stock_settings": low_stock_settings,
+        "purchase_history": purchase_history
     }
     try:
         data_collection.replace_one({"_id": "main_data"}, data, upsert=True)
@@ -111,6 +115,9 @@ def load_from_db():
             purchase_role_settings.update(data.get("purchase_role_settings", {}))
             verify_panels.clear()
             verify_panels.update(data.get("verify_panels", {}))
+            low_stock_settings.clear()
+            low_stock_settings.update(data.get("low_stock_settings", {}))
+            purchase_history[:] = data.get("purchase_history", [])
             print("MongoDB からデータを正常に復元しました。")
     except Exception as e:
         print(f"MongoDB 復元エラー: {e}")
@@ -261,6 +268,7 @@ class MainHelpSelect(discord.ui.Select):
             discord.SelectOption(label="自販機・商品管理", value="vending", description="自販機作成・設置・商品登録・削除", emoji="🛒"),
             discord.SelectOption(label="在庫管理", value="stock", description="在庫の追加・内容確認・引き出し", emoji="📦"),
             discord.SelectOption(label="クーポン管理", value="coupon", description="割引クーポンの作成・一覧・削除", emoji="🏷️"),
+            discord.SelectOption(label="売上・履歴", value="stats", description="自販機一覧・商品一覧・売上確認・購入履歴", emoji="📊"),
             discord.SelectOption(label="データ保存・復元", value="save_load", description="データのセーブ・ロード", emoji="💾"),
         ]
         super().__init__(placeholder="詳しく知りたい機能を選択してください...", min_values=1, max_values=1, options=options)
@@ -302,7 +310,9 @@ class MainHelpSelect(discord.ui.Select):
                             "・`/自販機削除 <vending_machine_id>` : 自販機を削除します。\n"
                             "・`/商品追加 ...` : 自販機に商品を登録します。\n"
                             "・`/商品内容変更 ...` : 価格や名前を変更します。\n"
-                            "・`/商品削除 ...` : 商品を削除します。",
+                            "・`/商品削除 ...` : 商品を削除します。\n"
+                            "・`/自販機一覧` / `/商品一覧` : 自販機・商品の状況を確認します。\n"
+                            "・`/自販機名変更 <vending_machine_id> <new_name>` : 自販機の名前を変更します。(管理者向け)",
                 color=discord.Color.gold()
             ),
             "stock": discord.Embed(
@@ -315,7 +325,10 @@ class MainHelpSelect(discord.ui.Select):
                             "・`/file在庫追加 <vending_machine_id> <merchandise> <file>` : テキストファイルから在庫を追加します。\n"
                             "  ※ 商品が有限なら1行=在庫1個、無限ならファイル全体を1つの在庫にします。\n"
                             "・`/在庫内容確認 <vending_machine_id>` : 全在庫を出力します。\n"
-                            "・`/在庫引出 <vending_machine_id> <quantity>` : 在庫を指定数引き出します。",
+                            "・`/在庫引出 <vending_machine_id> <quantity>` : 在庫を指定数引き出します。\n"
+                            "・`/在庫全削除 <vending_machine_id> <merchandise>` : 商品の在庫をすべて削除します。(管理者向け)\n"
+                            "・`/低在庫通知設定 <vending_machine_id> <channel> <threshold>` : 有限商品の在庫が少なくなった時・切れた時に通知します。\n"
+                            "・`/低在庫通知設定remove <vending_machine_id>` : 低在庫通知を解除します。",
                 color=discord.Color.orange()
             ),
             "coupon": discord.Embed(
@@ -326,6 +339,16 @@ class MainHelpSelect(discord.ui.Select):
                             "・`/クーポン一覧` : 有効なクーポン一覧を表示します。\n"
                             "・`/クーポン削除 ...` : クーポンを削除します。",
                 color=discord.Color.purple()
+            ),
+            "stats": discord.Embed(
+                title="📊 売上・履歴の詳細",
+                description="自販機や商品の状況、売上、購入履歴を確認します。\n\n"
+                            "**【コマンド】**\n"
+                            "・`/自販機一覧` : 作成済みの自販機と商品数・在庫合計を表示します。\n"
+                            "・`/商品一覧 <vending_machine_id>` : 商品の価格・在庫・売上を表示します。\n"
+                            "・`/売上確認 <vending_machine_id>` : 商品ごとの販売数ランキングを表示します。(管理者向け)\n"
+                            "・`/購入履歴 [user]` : 購入履歴(最新10件)を表示します。他の人の履歴は「サーバー管理」権限が必要です。",
+                color=discord.Color.blue()
             ),
             "save_load": discord.Embed(
                 title="💾 データ保存・復元の詳細",
@@ -428,6 +451,43 @@ async def coupon_autocomplete(interaction: discord.Interaction, current: str):
         if current.lower() in code.lower()
     ][:25]
 
+MAX_PURCHASE_HISTORY = 2000  # 保存する購入履歴の最大件数(古いものから削除)
+
+def record_purchase(user_id: int, v_id: str, item_name: str, qty: int):
+    """購入履歴を記録する(渡した商品の中身は保存しない)"""
+    purchase_history.append({
+        "user_id": user_id,
+        "vm_name": vending_machines.get(v_id, {}).get("name", ""),
+        "item_name": item_name,
+        "qty": qty,
+        "at": datetime.now(JST).strftime("%Y/%m/%d %H:%M:%S"),
+    })
+    if len(purchase_history) > MAX_PURCHASE_HISTORY:
+        del purchase_history[:len(purchase_history) - MAX_PURCHASE_HISTORY]
+
+async def notify_low_stock(guild, v_id: str, item: dict, qty: int):
+    """有限商品の在庫がしきい値を下回った瞬間と、在庫切れになった時に通知する"""
+    setting = low_stock_settings.get(v_id)
+    if not setting or guild is None or item["type"] != "有限":
+        return
+    remaining = len(item.get("stock_list", []))
+    threshold = setting["threshold"]
+    just_crossed = remaining <= threshold < remaining + qty
+    if remaining != 0 and not just_crossed:
+        return
+    channel = guild.get_channel(setting["channel_id"])
+    if not channel:
+        return
+    vm_name = vending_machines.get(v_id, {}).get("name", "")
+    if remaining == 0:
+        title, color = "🚫 在庫切れ", discord.Color.red()
+        text = f"自販機「{vm_name}」の商品「{item['name']}」が在庫切れになりました。"
+    else:
+        title, color = "⚠️ 在庫残りわずか", discord.Color.orange()
+        text = (f"自販機「{vm_name}」の商品「{item['name']}」の在庫が残り **{remaining}個** になりました。\n"
+                f"(通知しきい値: {threshold}個以下)")
+    await channel.send(embed=discord.Embed(title=title, description=text, color=color))
+
 async def deliver_items_to_dm(interaction: discord.Interaction, v_id: str, item_id: str, qty: int) -> bool:
     item = vending_machines.get(v_id, {}).get("items", {}).get(item_id)
     if not item:
@@ -481,7 +541,8 @@ async def deliver_items_to_dm(interaction: discord.Interaction, v_id: str, item_
         await interaction.followup.send(f"❌ 商品の送信に失敗しました: `{e}`\n※在庫は減っていません。", ephemeral=True)
         return False
 
-    # DM送信成功 → 在庫減少を確定
+    # DM送信成功 → 在庫減少と購入履歴を確定
+    record_purchase(interaction.user.id, v_id, item["name"], qty)
     save_to_db()
 
     # 以降(実績通知・ロール付与)で失敗しても、商品は届いているので購入は成功扱い
@@ -516,6 +577,11 @@ async def deliver_items_to_dm(interaction: discord.Interaction, v_id: str, item_
                         await apply_purchase_role(interaction.user, role, p_setting.get("deadline"))
     except Exception as e:
         print(f"購入後処理(実績通知/ロール付与)でエラー: {e}")
+
+    try:
+        await notify_low_stock(interaction.guild, v_id, item, qty)
+    except Exception as e:
+        print(f"低在庫通知でエラー: {e}")
 
     return True
 
@@ -964,7 +1030,8 @@ async def help_all_cmd(interaction: discord.Interaction):
     embed.add_field(name="✅ 認証機能", value="`/verify` : 認証パネル設置", inline=True)
     embed.add_field(name="💳 PayPay連携", value="`/paypay_login` : PayPay自動決済設定", inline=True)
     embed.add_field(name="🛒 自販機管理", value="`/自販機作成`, `/自販機設置` など", inline=True)
-    embed.add_field(name="📦 在庫管理", value="`/在庫追加`, `/file在庫追加`, `/在庫内容確認` など", inline=True)
+    embed.add_field(name="📦 在庫管理", value="`/在庫追加`, `/file在庫追加`, `/在庫全削除`, `/低在庫通知設定` など", inline=True)
+    embed.add_field(name="📊 売上・履歴", value="`/自販機一覧`, `/商品一覧`, `/売上確認`, `/購入履歴`", inline=True)
     embed.add_field(name="🏷️ クーポン管理", value="`/クーポン作成`, `/クーポン一覧` など", inline=True)
     embed.add_field(name="💾 セーブ/ロード", value="`/save`, `/load` でデータを保管", inline=True)
     embed.add_field(name="🧹 メッセージ削除", value="`/clear` : チャンネルメッセージ削除", inline=True)
@@ -997,7 +1064,9 @@ async def save_cmd(interaction: discord.Interaction):
         "proof_settings": proof_settings,
         "stock_add_settings": stock_add_settings,
         "purchase_role_settings": purchase_role_settings,
-        "verify_panels": verify_panels
+        "verify_panels": verify_panels,
+        "low_stock_settings": low_stock_settings,
+        "purchase_history": purchase_history
     }
     json_str = json.dumps(data, ensure_ascii=False)
     output_text = f"`{json_str}`"
@@ -1060,6 +1129,11 @@ async def load_cmd(interaction: discord.Interaction, data_text: str = None, file
             if "verify_panels" in data:
                 verify_panels.clear()
                 verify_panels.update(data["verify_panels"])
+            if "low_stock_settings" in data:
+                low_stock_settings.clear()
+                low_stock_settings.update(data["low_stock_settings"])
+            if "purchase_history" in data:
+                purchase_history[:] = data["purchase_history"]
         else:
             vending_machines.clear()
             vending_machines.update(data)
@@ -1231,6 +1305,8 @@ async def delete_vending_machine(interaction: discord.Interaction, vending_machi
             del stock_add_settings[vending_machine_id]
         if vending_machine_id in purchase_role_settings:
             del purchase_role_settings[vending_machine_id]
+        if vending_machine_id in low_stock_settings:
+            del low_stock_settings[vending_machine_id]
         save_to_db()
         await inter.response.edit_message(content=f"自販機「{target_name}」を完全に削除しました。", embed=None, view=None)
 
@@ -1791,6 +1867,214 @@ async def delete_coupon(interaction: discord.Interaction, code: str):
     view.add_item(cancel_btn)
 
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+# ===================== 追加機能 =====================
+
+async def send_in_chunks(interaction: discord.Interaction, lines: list, sep: str = "\n\n", limit: int = 1900):
+    """長い一覧を2000文字制限に収まるよう分割して一時メッセージで送信する"""
+    chunks, cur = [], ""
+    for line in lines:
+        if cur and len(cur) + len(sep) + len(line) > limit:
+            chunks.append(cur)
+            cur = line
+        else:
+            cur = f"{cur}{sep}{line}" if cur else line
+    if cur:
+        chunks.append(cur)
+    for idx, chunk in enumerate(chunks):
+        if idx == 0 and not interaction.response.is_done():
+            await interaction.response.send_message(chunk, ephemeral=True)
+        else:
+            await interaction.followup.send(chunk, ephemeral=True)
+
+def stock_count_text(item: dict) -> str:
+    return "無限" if item["type"] == "無限" else f"{len(item.get('stock_list', []))}個"
+
+@bot.tree.command(name="自販機一覧", description="作成済みの自販機を一覧表示します")
+async def list_vending_machines(interaction: discord.Interaction):
+    if not vending_machines:
+        await interaction.response.send_message("自販機がありません。`/自販機作成` で作成してください。", ephemeral=True)
+        return
+
+    lines = []
+    for vm in vending_machines.values():
+        items = vm.get("items", {})
+        finite_total = sum(len(i.get("stock_list", [])) for i in items.values() if i["type"] == "有限")
+        infinite_kinds = sum(1 for i in items.values() if i["type"] == "無限")
+        line = f"**{vm['name']}**\n商品数: {len(items)}種 / 有限在庫の合計: {finite_total}個"
+        if infinite_kinds:
+            line += f" / 無限商品: {infinite_kinds}種"
+        lines.append(line)
+    await send_in_chunks(interaction, lines)
+
+@bot.tree.command(name="商品一覧", description="自販機の商品を一覧表示します")
+@app_commands.describe(vending_machine_id="商品を確認する自販機")
+@app_commands.autocomplete(vending_machine_id=vending_machine_autocomplete)
+async def list_items(interaction: discord.Interaction, vending_machine_id: str):
+    vm = vending_machines.get(vending_machine_id)
+    if not vm:
+        await interaction.response.send_message("指定された自販機が見つかりません。", ephemeral=True)
+        return
+    if not vm.get("items"):
+        await interaction.response.send_message("商品が登録されていません。", ephemeral=True)
+        return
+
+    lines = []
+    for item in vm["items"].values():
+        emoji = safe_emoji(item.get("emoji"))
+        line = f"**{emoji + ' ' if emoji else ''}{item['name']}**"
+        if item.get("description"):
+            line += f"\n{item['description']}"
+        line += (f"\nタイプ: {item['type']} / マネー: {item['money']} / マネーライト: {item['manera']}"
+                 f"\n在庫: {stock_count_text(item)} / 売上: {item.get('sold_count', 0)}個")
+        lines.append(line)
+    await send_in_chunks(interaction, [f"📦 **{vm['name']}** の商品一覧"] + lines)
+
+@bot.tree.command(name="売上確認", description="自販機の商品ごとの販売数ランキングを表示します")
+@app_commands.describe(vending_machine_id="売上を確認する自販機")
+@app_commands.autocomplete(vending_machine_id=vending_machine_autocomplete)
+@app_commands.default_permissions(administrator=True)
+async def sales_summary(interaction: discord.Interaction, vending_machine_id: str):
+    vm = vending_machines.get(vending_machine_id)
+    if not vm:
+        await interaction.response.send_message("指定された自販機が見つかりません。", ephemeral=True)
+        return
+    if not vm.get("items"):
+        await interaction.response.send_message("商品が登録されていません。", ephemeral=True)
+        return
+
+    ranked = sorted(vm["items"].values(), key=lambda i: i.get("sold_count", 0), reverse=True)
+    total = sum(i.get("sold_count", 0) for i in ranked)
+    lines = [f"📊 **{vm['name']}** の売上\n合計販売数: **{total}個**"]
+    for rank, item in enumerate(ranked, 1):
+        lines.append(f"{rank}. {item['name']} : {item.get('sold_count', 0)}個 (在庫: {stock_count_text(item)})")
+    await send_in_chunks(interaction, lines, sep="\n")
+
+@bot.tree.command(name="自販機名変更", description="自販機の名前を変更します")
+@app_commands.describe(vending_machine_id="名前を変更する自販機", new_name="新しい名前")
+@app_commands.autocomplete(vending_machine_id=vending_machine_autocomplete)
+@app_commands.default_permissions(administrator=True)
+async def rename_vending_machine(interaction: discord.Interaction, vending_machine_id: str, new_name: str):
+    vm = vending_machines.get(vending_machine_id)
+    if not vm:
+        await interaction.response.send_message("指定された自販機が見つかりません。", ephemeral=True)
+        return
+
+    new_name = new_name.strip()
+    if not new_name or len(new_name) > 80:
+        await interaction.response.send_message("❌ 名前は1〜80文字で入力してください。", ephemeral=True)
+        return
+
+    old_name = vm["name"]
+    vm["name"] = new_name
+    save_to_db()
+    await interaction.response.send_message(f"✅ 自販機名を「{old_name}」から「{new_name}」に変更しました。", ephemeral=True)
+
+@bot.tree.command(name="在庫全削除", description="商品の在庫をすべて削除します")
+@app_commands.describe(vending_machine_id="対象の自販機", merchandise="在庫を削除する商品")
+@app_commands.autocomplete(vending_machine_id=vending_machine_autocomplete, merchandise=merchandise_autocomplete)
+@app_commands.default_permissions(administrator=True)
+async def clear_stock(interaction: discord.Interaction, vending_machine_id: str, merchandise: str):
+    vm = vending_machines.get(vending_machine_id)
+    if not vm:
+        await interaction.response.send_message("指定された自販機が見つかりません。", ephemeral=True)
+        return
+    item = vm.get("items", {}).get(merchandise)
+    if not item:
+        await interaction.response.send_message("指定された商品が見つかりません。候補から選択してください。", ephemeral=True)
+        return
+
+    count = len(item.get("stock_list", []))
+    if count == 0:
+        await interaction.response.send_message(f"「{item['name']}」の在庫はすでに空です。", ephemeral=True)
+        return
+
+    warn = "\n※無限商品のため、削除すると配布する内容がなくなります。" if item["type"] == "無限" else ""
+    view = discord.ui.View(timeout=None)
+    confirm_btn = discord.ui.Button(label="削除する", style=discord.ButtonStyle.danger)
+    cancel_btn = discord.ui.Button(label="キャンセル", style=discord.ButtonStyle.secondary)
+
+    async def confirm_cb(inter: discord.Interaction):
+        target = vending_machines.get(vending_machine_id, {}).get("items", {}).get(merchandise)
+        if not target:
+            await inter.response.edit_message(content="商品が見つかりませんでした。", view=None)
+            return
+        removed = len(target.get("stock_list", []))
+        target["stock_list"] = []
+        save_to_db()
+        await inter.response.edit_message(content=f"✅ 「{target['name']}」の在庫 {removed}件 を削除しました。", view=None)
+
+    async def cancel_cb(inter: discord.Interaction):
+        await inter.response.edit_message(content="処理をキャンセルしました。", view=None)
+
+    confirm_btn.callback = confirm_cb
+    cancel_btn.callback = cancel_cb
+    view.add_item(confirm_btn)
+    view.add_item(cancel_btn)
+
+    await interaction.response.send_message(
+        f"本当に「{item['name']}」の在庫 {count}件 をすべて削除しますか？\n実行した場合この操作は取り消せません。{warn}",
+        view=view, ephemeral=True
+    )
+
+@bot.tree.command(name="低在庫通知設定", description="有限商品の在庫が少なくなった時・切れた時に通知する設定を行います")
+@app_commands.describe(
+    vending_machine_id="在庫を監視する自販機",
+    channel="通知を送信するチャンネル",
+    threshold="在庫がこの個数以下になったら通知(1以上)"
+)
+@app_commands.autocomplete(vending_machine_id=vending_machine_autocomplete)
+@app_commands.default_permissions(administrator=True)
+async def set_low_stock_notification(interaction: discord.Interaction, vending_machine_id: str, channel: discord.TextChannel, threshold: int):
+    if vending_machine_id not in vending_machines:
+        await interaction.response.send_message("❌ 指定された自販機が存在しません。", ephemeral=True)
+        return
+    if threshold < 1 or threshold > 100000:
+        await interaction.response.send_message("❌ threshold は1以上の整数で入力してください。", ephemeral=True)
+        return
+
+    low_stock_settings[vending_machine_id] = {"channel_id": channel.id, "threshold": threshold}
+    save_to_db()
+
+    vm_name = vending_machines[vending_machine_id]["name"]
+    await interaction.response.send_message(
+        f"✅ 自販機「{vm_name}」の低在庫通知を設定しました。\n"
+        f"送信先: {channel.mention}\n"
+        f"通知条件: 在庫が{threshold}個以下になった時 / 在庫切れになった時 (有限商品のみ)",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="低在庫通知設定remove", description="低在庫通知設定を削除します")
+@app_commands.describe(vending_machine_id="低在庫通知を外す自販機")
+@app_commands.autocomplete(vending_machine_id=vending_machine_autocomplete)
+@app_commands.default_permissions(administrator=True)
+async def remove_low_stock_notification(interaction: discord.Interaction, vending_machine_id: str):
+    if vending_machine_id in low_stock_settings:
+        del low_stock_settings[vending_machine_id]
+        save_to_db()
+        await interaction.response.send_message("✅ 低在庫通知設定を解除しました。", ephemeral=True)
+    else:
+        await interaction.response.send_message("⚠️ この自販機には低在庫通知が設定されていません。", ephemeral=True)
+
+@bot.tree.command(name="購入履歴", description="購入履歴(最新10件)を表示します")
+@app_commands.describe(user="確認するユーザー(省略すると自分。他の人は「サーバー管理」権限が必要)")
+async def purchase_history_cmd(interaction: discord.Interaction, user: discord.Member = None):
+    target = user or interaction.user
+    if target.id != interaction.user.id:
+        perms = getattr(interaction.user, "guild_permissions", None)
+        if not (perms and perms.manage_guild):
+            await interaction.response.send_message("❌ 他の人の購入履歴を見るには「サーバー管理」権限が必要です。", ephemeral=True)
+            return
+
+    records = [r for r in purchase_history if r.get("user_id") == target.id][-10:][::-1]
+    if not records:
+        await interaction.response.send_message("購入履歴はありません。", ephemeral=True)
+        return
+
+    lines = [f"🧾 **{target.display_name}** さんの購入履歴 (最新{len(records)}件)"]
+    for r in records:
+        lines.append(f"`{r['at']}` {r['vm_name']} / {r['item_name']} ×{r['qty']}")
+    await send_in_chunks(interaction, lines, sep="\n")
 
 @bot.tree.command(name="clear", description="実行したチャンネルのメッセージをすべて削除します")
 @app_commands.checks.has_permissions(manage_messages=True)
