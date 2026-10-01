@@ -177,6 +177,151 @@ def format_stock_item(raw_content: str) -> str:
 
     return result
 
+# ===================== 在庫ファイル(画像など)の保存・配布 =====================
+STOCK_FILE_DIR = "stock_files"                 # DB未接続時のローカル保存先
+MAX_STOCK_FILE_SIZE = 25 * 1024 * 1024         # /file在庫追加 の添付ファイル上限 (25MB)
+MAX_DM_FILES_PER_MESSAGE = 10                  # 1通のDMに添付できるファイル数
+MAX_DM_BATCH_BYTES = 20 * 1024 * 1024          # 1通のDMにまとめる合計サイズ(Discord無料枠の上限に合わせる)
+_stock_fs = None
+
+class StockFileError(Exception):
+    """在庫ファイルの保存・読込に失敗した"""
+
+def is_file_entry(entry) -> bool:
+    return isinstance(entry, dict) and entry.get("kind") == "file"
+
+def entry_text(entry) -> str:
+    """在庫1件のテキスト部分(ファイル在庫は空文字)"""
+    if isinstance(entry, str):
+        return entry
+    if is_file_entry(entry):
+        return ""
+    return entry.get("content", "") if isinstance(entry, dict) else ""
+
+def fmt_size(n) -> str:
+    n = int(n or 0)
+    if n >= 1024 * 1024:
+        return f"{n / 1024 / 1024:.1f}MB"
+    if n >= 1024:
+        return f"{n / 1024:.0f}KB"
+    return f"{n}B"
+
+def describe_stock_entry(entry) -> str:
+    if is_file_entry(entry):
+        return f"📎 ファイル: {entry.get('name', 'file')} ({fmt_size(entry.get('size'))})"
+    return format_stock_item(entry_text(entry))
+
+def _get_gridfs():
+    global _stock_fs
+    if db is None:
+        return None
+    if _stock_fs is None:
+        import gridfs
+        _stock_fs = gridfs.GridFS(db, collection="stock_files")
+    return _stock_fs
+
+def _oid(file_id: str):
+    from bson import ObjectId
+    return ObjectId(file_id)
+
+def _local_path(file_id: str) -> str:
+    name = file_id[len("local:"):]
+    if not re.fullmatch(r"[0-9a-f]{32}", name):
+        raise StockFileError("不正なファイルIDです")
+    return os.path.join(STOCK_FILE_DIR, name)
+
+def store_stock_file(data: bytes, filename: str) -> str:
+    """ファイルを保存してIDを返す(MongoDB GridFS。DB未接続時はローカルフォルダ)"""
+    fs = _get_gridfs()
+    if fs is not None:
+        return str(fs.put(data, filename=filename))
+    os.makedirs(STOCK_FILE_DIR, exist_ok=True)
+    file_id = uuid.uuid4().hex
+    with open(os.path.join(STOCK_FILE_DIR, file_id), "wb") as f:
+        f.write(data)
+    return "local:" + file_id
+
+def read_stock_file(file_id: str) -> bytes:
+    try:
+        if file_id.startswith("local:"):
+            with open(_local_path(file_id), "rb") as f:
+                return f.read()
+        fs = _get_gridfs()
+        if fs is None:
+            raise StockFileError("データベースに接続されていません")
+        return fs.get(_oid(file_id)).read()
+    except StockFileError:
+        raise
+    except Exception as e:
+        raise StockFileError(f"ファイルを読み込めません: {e}") from e
+
+def stock_file_exists(file_id: str) -> bool:
+    try:
+        if file_id.startswith("local:"):
+            return os.path.isfile(_local_path(file_id))
+        fs = _get_gridfs()
+        return bool(fs is not None and fs.exists(_oid(file_id)))
+    except Exception:
+        return False
+
+def delete_stock_file(file_id: str):
+    try:
+        if file_id.startswith("local:"):
+            path = _local_path(file_id)
+            if os.path.isfile(path):
+                os.remove(path)
+        else:
+            fs = _get_gridfs()
+            if fs is not None:
+                fs.delete(_oid(file_id))
+    except Exception as e:
+        print(f"在庫ファイルの削除に失敗しました ({file_id}): {e}")
+
+def _unique_file_ids(entries) -> list:
+    ids = []
+    for e in entries:
+        if is_file_entry(e) and e.get("file_id") and e["file_id"] not in ids:
+            ids.append(e["file_id"])
+    return ids
+
+def find_missing_stock_files(entries) -> list:
+    return [fid for fid in _unique_file_ids(entries) if not stock_file_exists(fid)]
+
+def delete_stock_files(entries):
+    for fid in _unique_file_ids(entries):
+        delete_stock_file(fid)
+
+async def purge_stock_entries(entries):
+    """在庫から外れたファイルの実体を削除する(ファイル以外の在庫は無視)"""
+    if not any(is_file_entry(e) for e in entries):
+        return
+    try:
+        await asyncio.to_thread(delete_stock_files, entries)
+    except Exception as e:
+        print(f"在庫ファイルの削除でエラー: {e}")
+
+def plan_file_batches(sizes: list) -> list:
+    """ファイルを「1通あたり10個まで・合計20MBまで」に分ける。(開始, 終了) のリストを返す"""
+    batches, start, total = [], 0, 0
+    for i, size in enumerate(sizes):
+        count = i - start
+        if count > 0 and (count >= MAX_DM_FILES_PER_MESSAGE or total + size > MAX_DM_BATCH_BYTES):
+            batches.append((start, i))
+            start, total = i, 0
+        total += size
+    if sizes:
+        batches.append((start, len(sizes)))
+    return batches
+
+async def build_discord_files(entries, cache: dict) -> list:
+    files = []
+    for e in entries:
+        fid = e["file_id"]
+        if fid not in cache:
+            cache[fid] = await asyncio.to_thread(read_stock_file, fid)
+        files.append(discord.File(io.BytesIO(cache[fid]), filename=e.get("name") or "file"))
+    return files
+
 class CloseTicketButton(discord.ui.Button):
     def __init__(self):
         super().__init__(style=discord.ButtonStyle.danger, label="🔒┋チケットを閉じる", custom_id="close_ticket_btn")
@@ -271,7 +416,7 @@ class MainHelpSelect(discord.ui.Select):
             discord.SelectOption(label="売上・履歴", value="stats", description="自販機一覧・商品一覧・売上確認・購入履歴", emoji="📊"),
             discord.SelectOption(label="データ保存・復元", value="save_load", description="データのセーブ・ロード", emoji="💾"),
         ]
-        super().__init__(placeholder="詳しく知りたい機能を選択してください...", min_values=1, max_values=1, options=options)
+        super().__init__(custom_id="main_help_select", placeholder="詳しく知りたい機能を選択してください...", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
         val = self.values[0]
@@ -322,8 +467,8 @@ class MainHelpSelect(discord.ui.Select):
                             "・`/在庫追加 <vending_machine_id>` : 商品に在庫を追加します。\n"
                             "  ※ `{内容}` でインラインコード枠、`{{内容}}` でコードブロック。\n"
                             "  ※ 改行したい場所には `\\n` を入力してください。\n"
-                            "・`/file在庫追加 <vending_machine_id> <merchandise> <file>` : テキストファイルから在庫を追加します。\n"
-                            "  ※ 商品が有限なら1行=在庫1個、無限ならファイル全体を1つの在庫にします。\n"
+                            "・`/file在庫追加 <vending_machine_id> <merchandise> <file> [send_as_file]` : 添付ファイルを在庫として追加します。(25MBまで・画像等もOK)\n"
+                            "  ※ txtは、有限なら1行=在庫1個・無限ならファイル全体を1つの在庫にします。txt以外(画像・zip等)は、そのファイル自体を1個の在庫として配布します。\n"
                             "・`/在庫内容確認 <vending_machine_id>` : 全在庫を出力します。\n"
                             "・`/在庫引出 <vending_machine_id> <quantity>` : 在庫を指定数引き出します。\n"
                             "・`/在庫全削除 <vending_machine_id> <merchandise>` : 商品の在庫をすべて削除します。(管理者向け)\n"
@@ -376,7 +521,7 @@ class MemberHelpSelect(discord.ui.Select):
             discord.SelectOption(label="📩 商品の受取方法", value="dm_info", description="購入後のDM受取・確認方法", emoji="📩"),
             discord.SelectOption(label="❓ よくある質問・FAQ", value="faq", description="エラーや困ったときの対処法", emoji="❓"),
         ]
-        super().__init__(placeholder="知りたい項目を選択してください...", min_values=1, max_values=1, options=options)
+        super().__init__(custom_id="member_help_select", placeholder="知りたい項目を選択してください...", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
         val = self.values[0]
@@ -515,35 +660,104 @@ async def deliver_items_to_dm(interaction: discord.Interaction, v_id: str, item_
         item["sold_count"] = max(0, item.get("sold_count", 0) - qty)
         save_to_db()
 
-    raw_stock_content = ""
-    for d in drawn:
-        content_str = d if isinstance(d, str) else d.get("content", "")
-        raw_stock_content += content_str
+    text_entries = [entry_text(d) for d in drawn if not is_file_entry(d)]
+    file_entries = [d for d in drawn if is_file_entry(d)]
+    raw_stock_content = "\n".join(t for t in text_entries if t)
 
     header = "{{ご購入ありがとうございます}}{{商品:" + item['name'] + "}}"
     full_text = header + raw_stock_content
 
+    description = format_stock_item(full_text)
+    if file_entries:
+        labels = []
+        for fe in file_entries:
+            label = f"{fe.get('name', 'file')} ({fmt_size(fe.get('size'))})"
+            if label not in labels:
+                labels.append(label)
+        description += "\n📎 添付ファイル: " + ", ".join(labels)
+
     embed = discord.Embed(
         title="✅購入が完了しました",
-        description=format_stock_item(full_text),
+        description=description[:4096],
         color=discord.Color.green()
     )
 
-    # 購入者に商品を送信(失敗したら在庫・売上数を元に戻す)
+    # 送信前にファイルの存在を確認(無ければ在庫を戻して中止)
+    if file_entries:
+        missing = await asyncio.to_thread(find_missing_stock_files, file_entries)
+        if missing:
+            rollback_stock()
+            await interaction.followup.send("❌ 商品ファイルが見つかりませんでした。管理者に連絡してください。\n※在庫は減っていません。", ephemeral=True)
+            return False
+
+    batches = plan_file_batches([fe.get("size", 0) for fe in file_entries])
+    data_cache = {}
+
+    # 購入者に商品を送信(最初のDMに失敗したら在庫・売上数を元に戻す)
     try:
-        await interaction.user.send(embed=embed)
+        first_files = []
+        if batches:
+            s, e_ = batches[0]
+            first_files = await build_discord_files(file_entries[s:e_], data_cache)
+        if first_files:
+            await interaction.user.send(embed=embed, files=first_files)
+        else:
+            await interaction.user.send(embed=embed)
+        data_cache.clear()
     except discord.Forbidden:
         rollback_stock()
         await interaction.followup.send("❌ DMの送信に失敗しました。DMの受取許可設定を確認してください。\n※在庫は減っていません。", ephemeral=True)
         return False
-    except discord.HTTPException as e:
+    except discord.HTTPException as exc:
         rollback_stock()
-        await interaction.followup.send(f"❌ 商品の送信に失敗しました: `{e}`\n※在庫は減っていません。", ephemeral=True)
+        hint = ""
+        if getattr(exc, "status", None) == 413 or getattr(exc, "code", None) == 40005:
+            hint = "\n(ファイルがDiscordの送信上限を超えている可能性があります)"
+        await interaction.followup.send(f"❌ 商品の送信に失敗しました: `{exc}`{hint}\n※在庫は減っていません。", ephemeral=True)
+        return False
+    except StockFileError as exc:
+        rollback_stock()
+        await interaction.followup.send(f"❌ 商品ファイルを読み込めませんでした。管理者に連絡してください。\n`{exc}`\n※在庫は減っていません。", ephemeral=True)
         return False
 
-    # DM送信成功 → 在庫減少と購入履歴を確定
+    # 2通目以降(ファイルが多い/大きい場合は複数のDMに分けて送る)
+    sent_files = batches[0][1] if batches else 0
+    send_error = None
+    for idx in range(1, len(batches)):
+        s, e_ = batches[idx]
+        try:
+            files = await build_discord_files(file_entries[s:e_], data_cache)
+            await interaction.user.send(content=f"📎 添付ファイル ({idx + 1}/{len(batches)})", files=files)
+            sent_files = e_
+            data_cache.clear()
+        except (discord.HTTPException, StockFileError) as exc:
+            send_error = exc
+            break
+
+    if send_error is not None:
+        # 途中で失敗: 送信済みの分だけ確定し、未送信のファイル在庫は戻す
+        unsent = file_entries[sent_files:]
+        if item["type"] == "有限":
+            item["stock_list"] = list(unsent) + item.get("stock_list", [])
+        item["sold_count"] = max(0, item.get("sold_count", 0) - len(unsent))
+        delivered = qty - len(unsent)
+        if delivered > 0:
+            record_purchase(interaction.user.id, v_id, item["name"], delivered)
+        save_to_db()
+        if item["type"] == "有限":
+            await purge_stock_entries(file_entries[:sent_files])
+        await interaction.followup.send(
+            f"⚠️ 一部のファイルを送信できませんでした。({sent_files}/{len(file_entries)}個 送信済み)\n"
+            f"未送信分の在庫は減っていません。管理者に連絡してください。\n`{send_error}`",
+            ephemeral=True
+        )
+        return False
+
+    # 全て送信成功 → 在庫減少と購入履歴を確定
     record_purchase(interaction.user.id, v_id, item["name"], qty)
     save_to_db()
+    if item["type"] == "有限":
+        await purge_stock_entries(file_entries)  # 配布済みの有限ファイルは保存領域から削除
 
     # 以降(実績通知・ロール付与)で失敗しても、商品は届いているので購入は成功扱い
     try:
@@ -887,9 +1101,11 @@ class DeleteItemSelect(discord.ui.Select):
         cancel_btn = discord.ui.Button(label="キャンセル", style=discord.ButtonStyle.secondary)
 
         async def confirm_callback(inter: discord.Interaction):
+            removed_entries = vending_machines[self.v_id]["items"][item_id].get("stock_list", [])
             del vending_machines[self.v_id]["items"][item_id]
             save_to_db()
             await inter.response.edit_message(content=f"選択した商品「{item_name}」を削除しました。", view=None)
+            await purge_stock_entries(removed_entries)
 
         async def cancel_callback(inter: discord.Interaction):
             await inter.response.edit_message(content="処理をキャンセルしました。", view=None)
@@ -1159,6 +1375,8 @@ def register_persistent_views():
     """再起動後・/load後もボタンが反応するように永続Viewを(再)登録する"""
     bot.add_view(TicketView(label="📩┋チケットを作成", button_color="#5865F2"))
     bot.add_view(TicketCloseView())
+    bot.add_view(MainHelpView())
+    bot.add_view(MemberHelpView())
 
     for role_id_str, panel_data in verify_panels.items():
         try:
@@ -1192,7 +1410,11 @@ async def on_ready():
         except Exception:
             pass
 
-    await bot.tree.sync()
+    try:
+        synced = await bot.tree.sync()
+        print(f"スラッシュコマンドを同期しました: {len(synced)}個")
+    except Exception as e:
+        print(f"スラッシュコマンドの同期に失敗しました: {e}")
     print(f"Bot ログイン完了: {bot.user}")
 
 @bot.tree.command(name="ticket", description="チケットパネルを設置します")
@@ -1298,6 +1520,11 @@ async def delete_vending_machine(interaction: discord.Interaction, vending_machi
     cancel_btn = discord.ui.Button(label="キャンセル", style=discord.ButtonStyle.secondary)
 
     async def delete_cb(inter: discord.Interaction):
+        removed_entries = [
+            entry
+            for it in vending_machines.get(vending_machine_id, {}).get("items", {}).values()
+            for entry in it.get("stock_list", [])
+        ]
         del vending_machines[vending_machine_id]
         if vending_machine_id in proof_settings:
             del proof_settings[vending_machine_id]
@@ -1309,6 +1536,7 @@ async def delete_vending_machine(interaction: discord.Interaction, vending_machi
             del low_stock_settings[vending_machine_id]
         save_to_db()
         await inter.response.edit_message(content=f"自販機「{target_name}」を完全に削除しました。", embed=None, view=None)
+        await purge_stock_entries(removed_entries)
 
     async def cancel_cb(inter: discord.Interaction):
         await inter.response.edit_message(content="削除をキャンセルしました。", embed=None, view=None)
@@ -1466,21 +1694,47 @@ async def add_stock(interaction: discord.Interaction, vending_machine_id: str):
     view.add_item(select)
     await interaction.response.send_message("商品を選択してください", view=view, ephemeral=True)
 
-MAX_STOCK_FILE_SIZE = 1 * 1024 * 1024   # 添付ファイルの上限 (1MB)
-MAX_STOCK_ENTRY_LEN = 1500              # 在庫1件あたりの上限文字数 (/在庫追加 のモーダルと同じ)
+MAX_STOCK_TEXT_SIZE = 1 * 1024 * 1024   # txt を「1行=在庫1個」として読み取る場合の上限 (1MB)
+MAX_STOCK_ENTRY_LEN = 1500              # テキスト在庫1件あたりの上限文字数 (/在庫追加 のモーダルと同じ)
 
-@bot.tree.command(name="file在庫追加", description="添付したテキストファイルの内容を在庫として追加します")
+def is_text_attachment(att) -> bool:
+    name = (att.filename or "").lower()
+    ctype = (att.content_type or "").lower()
+    return name.endswith(".txt") or ctype.startswith("text/plain")
+
+async def notify_stock_added(interaction: discord.Interaction, vm: dict, item: dict, v_id: str, count: int):
+    if v_id not in stock_add_settings or not interaction.guild:
+        return
+    try:
+        setting = stock_add_settings[v_id]
+        target_channel = interaction.guild.get_channel(setting["channel_id"])
+        if target_channel:
+            now_str = datetime.now(JST).strftime("%Y/%m/%d/%H:%M:%S.%f")[:-3]
+            add_desc = (
+                f"**チャンネル**\n{interaction.channel.mention}\n"
+                f"**自販機**\n```{vm['name']}```"
+                f"**商品名**\n```{item['name']}```"
+                f"**個数**\n```{count}```"
+                f"**追加日**\n```{now_str}```"
+            )
+            await target_channel.send(embed=discord.Embed(description=add_desc, color=discord.Color.green()))
+    except Exception as e:
+        print(f"在庫追加通知の送信に失敗: {e}")
+
+@bot.tree.command(name="file在庫追加", description="添付したファイルを在庫として追加します(txtは1行=在庫1個)")
 @app_commands.describe(
     vending_machine_id="在庫を追加する自販機",
     merchandise="在庫を追加する商品",
-    file="在庫にするテキストファイル(.txt) ※有限: 1行=在庫1個 / 無限: ファイル全体を1つの在庫"
+    file="在庫にするファイル(25MBまで。画像・zip等もOK)",
+    send_as_file="txtも中身を読み取らず、ファイルのまま配布する場合はTrue"
 )
 @app_commands.autocomplete(vending_machine_id=vending_machine_autocomplete, merchandise=merchandise_autocomplete)
 async def file_add_stock(
     interaction: discord.Interaction,
     vending_machine_id: str,
     merchandise: str,
-    file: discord.Attachment
+    file: discord.Attachment,
+    send_as_file: bool = False
 ):
     vm = vending_machines.get(vending_machine_id)
     if not vm:
@@ -1493,10 +1747,18 @@ async def file_add_stock(
         return
 
     type = item["type"]  # 有限/無限 は商品登録時の設定を使う
+    as_text = is_text_attachment(file) and not send_as_file
 
     if file.size > MAX_STOCK_FILE_SIZE:
         await interaction.response.send_message(
             f"❌ ファイルが大きすぎます。({MAX_STOCK_FILE_SIZE // 1024 // 1024}MB以下にしてください)",
+            ephemeral=True
+        )
+        return
+    if as_text and file.size > MAX_STOCK_TEXT_SIZE:
+        await interaction.response.send_message(
+            f"❌ txtを1行ごとの在庫として読み取る場合は{MAX_STOCK_TEXT_SIZE // 1024 // 1024}MBまでです。\n"
+            f"大きいファイルは send_as_file を True にして、ファイルのまま登録してください。",
             ephemeral=True
         )
         return
@@ -1509,72 +1771,74 @@ async def file_add_stock(
         await interaction.followup.send(f"❌ ファイルの読み込みに失敗しました: `{e}`", ephemeral=True)
         return
 
-    text = None
-    for enc in ("utf-8-sig", "cp932"):
-        try:
-            text = raw.decode(enc)
-            break
-        except UnicodeDecodeError:
-            continue
-    if text is None:
-        await interaction.followup.send("❌ ファイルの文字コードを読み取れませんでした。テキストファイル(UTF-8)を添付してください。", ephemeral=True)
-        return
+    if as_text:
+        # ---- テキスト: 有限=1行ごとに1在庫 / 無限=ファイル全体を1在庫 ----
+        text = None
+        for enc in ("utf-8-sig", "cp932"):
+            try:
+                text = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        if text is None:
+            await interaction.followup.send("❌ ファイルの文字コードを読み取れませんでした。テキストファイル(UTF-8)を添付してください。", ephemeral=True)
+            return
 
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
 
-    if type == "有限":
-        entries = [line.strip() for line in text.split("\n") if line.strip()]
+        if type == "有限":
+            entries = [line.strip() for line in text.split("\n") if line.strip()]
+        else:
+            whole = text.strip()
+            entries = [whole] if whole else []
+
+        if not entries:
+            await interaction.followup.send("❌ ファイルに有効な内容がありません。", ephemeral=True)
+            return
+
+        too_long = [i for i, e in enumerate(entries, 1) if len(e) > MAX_STOCK_ENTRY_LEN]
+        if too_long:
+            target = "ファイル全体" if type == "無限" else f"{too_long[0]}件目"
+            await interaction.followup.send(
+                f"❌ 在庫1件あたりの上限は{MAX_STOCK_ENTRY_LEN}文字です。({target}が超過しています)",
+                ephemeral=True
+            )
+            return
+
+        preview = format_stock_item(entries[0])
+        if len(preview) > 500:
+            preview = preview[:500] + "..."
     else:
-        whole = text.strip()
-        entries = [whole] if whole else []
-
-    if not entries:
-        await interaction.followup.send("❌ ファイルに有効な内容がありません。", ephemeral=True)
-        return
-
-    too_long = [i for i, e in enumerate(entries, 1) if len(e) > MAX_STOCK_ENTRY_LEN]
-    if too_long:
-        target = "ファイル全体" if type == "無限" else f"{too_long[0]}件目"
-        await interaction.followup.send(
-            f"❌ 在庫1件あたりの上限は{MAX_STOCK_ENTRY_LEN}文字です。({target}が超過しています)",
-            ephemeral=True
-        )
-        return
+        # ---- テキスト以外(画像・zip・pdf など): ファイルそのものを1個の在庫として保存 ----
+        if not raw:
+            await interaction.followup.send("❌ ファイルが空です。", ephemeral=True)
+            return
+        try:
+            file_id = await asyncio.to_thread(store_stock_file, raw, file.filename)
+        except Exception as e:
+            await interaction.followup.send(f"❌ ファイルの保存に失敗しました: `{e}`", ephemeral=True)
+            return
+        entries = [{"kind": "file", "file_id": file_id, "name": file.filename, "size": len(raw)}]
+        preview = describe_stock_entry(entries[0])
 
     if "stock_list" not in item:
         item["stock_list"] = []
 
+    old_entries = []
     if type == "有限":
         item["stock_list"].extend(entries)
         result_text = f"✅ 「{item['name']}」に在庫を **{len(entries)}個** 追加しました。(現在在庫: {len(item['stock_list'])}個)"
     else:
         # 無限在庫は先頭の1件を繰り返し配布する仕様のため、内容を置き換える
+        old_entries = item["stock_list"]
         item["stock_list"] = entries
         result_text = f"✅ 「{item['name']}」の無限在庫の内容を登録しました。"
 
     save_to_db()
+    await purge_stock_entries(old_entries)  # 置き換え前のファイルがあれば保存領域から削除
 
-    preview = format_stock_item(entries[0])
-    if len(preview) > 500:
-        preview = preview[:500] + "..."
     await interaction.followup.send(f"{result_text}\n購入時に送信される内容(先頭のみ):\n{preview}", ephemeral=True)
-
-    if vending_machine_id in stock_add_settings and interaction.guild:
-        try:
-            setting = stock_add_settings[vending_machine_id]
-            target_channel = interaction.guild.get_channel(setting["channel_id"])
-            if target_channel:
-                now_str = datetime.now(JST).strftime("%Y/%m/%d/%H:%M:%S.%f")[:-3]
-                add_desc = (
-                    f"**チャンネル**\n{interaction.channel.mention}\n"
-                    f"**自販機**\n```{vm['name']}```"
-                    f"**商品名**\n```{item['name']}```"
-                    f"**個数**\n```{len(entries) if type == '有限' else 1}```"
-                    f"**追加日**\n```{now_str}```"
-                )
-                await target_channel.send(embed=discord.Embed(description=add_desc, color=discord.Color.green()))
-        except Exception as e:
-            print(f"在庫追加通知の送信に失敗: {e}")
+    await notify_stock_added(interaction, vm, item, vending_machine_id, len(entries) if type == "有限" else 1)
 
 @bot.tree.command(name="在庫内容確認", description="自販機内のすべての在庫を出力")
 @app_commands.describe(vending_machine_id="在庫の内容を確認する自販機")
@@ -1588,8 +1852,7 @@ async def check_stock(interaction: discord.Interaction, vending_machine_id: str)
     lines = []
     for i_data in vm["items"].values():
         for st in i_data.get("stock_list", []):
-            content_str = st if isinstance(st, str) else st.get("content", "")
-            lines.append(format_stock_item(content_str))
+            lines.append(describe_stock_entry(st))
 
     if not lines:
         await interaction.response.send_message("在庫はありません。", ephemeral=True)
@@ -1633,11 +1896,29 @@ async def withdraw_stock(interaction: discord.Interaction, vending_machine_id: s
             return
 
         drawn = stock_list[:quantity]
+        file_drawn = [d for d in drawn if is_file_entry(d)]
+        if len(file_drawn) > MAX_DM_FILES_PER_MESSAGE:
+            await inter.response.send_message(f"ファイルを含む在庫は一度に{MAX_DM_FILES_PER_MESSAGE}個までしか引き出せません。", ephemeral=True)
+            return
+
+        await inter.response.defer(ephemeral=True)
         item["stock_list"] = stock_list[quantity:]
         save_to_db()
 
-        drawn_text = "\n".join([format_stock_item(d if isinstance(d, str) else d.get("content", "")) for d in drawn])
-        await inter.response.send_message(f"在庫「\n{drawn_text}\n」を引き出しました。", ephemeral=True)
+        drawn_text = "\n".join([describe_stock_entry(d) for d in drawn])
+        try:
+            await inter.followup.send(f"在庫「\n{drawn_text}\n」を引き出しました。", ephemeral=True)
+            cache = {}
+            for s, e_ in plan_file_batches([d.get("size", 0) for d in file_drawn]):
+                files = await build_discord_files(file_drawn[s:e_], cache)
+                await inter.followup.send(files=files, ephemeral=True)
+                cache.clear()
+        except (discord.HTTPException, StockFileError) as exc:
+            item["stock_list"] = list(drawn) + item.get("stock_list", [])
+            save_to_db()
+            await inter.followup.send(f"❌ ファイルの送信に失敗したため、在庫を元に戻しました。\n`{exc}`", ephemeral=True)
+            return
+        await purge_stock_entries(file_drawn)
 
     select.callback = select_callback
     view = discord.ui.View(timeout=None)
@@ -1999,10 +2280,12 @@ async def clear_stock(interaction: discord.Interaction, vending_machine_id: str,
         if not target:
             await inter.response.edit_message(content="商品が見つかりませんでした。", view=None)
             return
-        removed = len(target.get("stock_list", []))
+        old_entries = target.get("stock_list", [])
+        removed = len(old_entries)
         target["stock_list"] = []
         save_to_db()
         await inter.response.edit_message(content=f"✅ 「{target['name']}」の在庫 {removed}件 を削除しました。", view=None)
+        await purge_stock_entries(old_entries)
 
     async def cancel_cb(inter: discord.Interaction):
         await inter.response.edit_message(content="処理をキャンセルしました。", view=None)
