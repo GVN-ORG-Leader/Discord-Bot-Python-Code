@@ -164,10 +164,17 @@ def parse_color(color_hex: str) -> discord.Color:
 # ❌が付いていないエラーメッセージも赤で表示するための目印
 UI_ERROR_WORDS = ("見つかりません", "存在しません", "失敗", "エラー", "できません", "足りません", "不足", "不正", "無効", "大きすぎ")
 
-def bold_text(text: str) -> str:
-    """Embedの本文は通常メッセージより小さく見えるため、各行を太字にして読みやすくする。
-    コードブロック内・空行・見出し/引用/箇条書きの行はそのまま(表示が崩れないように)"""
-    out, in_code = [], False
+# 返信の太字の付け方: "first"=1行目(要点)だけ太字 / "all"=全行太字 / "none"=太字にしない
+UI_BOLD_MODE = "first"
+
+def bold_text(text: str, mode: str = None) -> str:
+    """Embedの本文は通常メッセージより小さく見えるため、要点(1行目)を太字にして読みやすくする。
+    コードブロック内・空行・見出し/引用/箇条書きの行は太字にしない(表示が崩れないように)。
+    2行目以降は元の書式(**強調**など)をそのまま残す"""
+    mode = mode or UI_BOLD_MODE
+    if mode == "none":
+        return str(text)
+    out, in_code, bolded_first = [], False, False
     for line in str(text).split("\n"):
         stripped = line.strip()
         if stripped.startswith("```"):
@@ -176,8 +183,11 @@ def bold_text(text: str) -> str:
             out.append(line)
         elif in_code or not stripped or stripped.startswith(("#", ">", "- ", "* ")):
             out.append(line)
-        else:
+        elif mode == "all" or not bolded_first:
             out.append("**" + stripped.replace("**", "") + "**")
+            bolded_first = True
+        else:
+            out.append(line)
     return "\n".join(out)
 
 def ui_embed(text, color=None) -> discord.Embed:
@@ -195,9 +205,9 @@ def ui_embed(text, color=None) -> discord.Embed:
             color = discord.Color.green()
     return discord.Embed(description=bold_text(text)[:4096], color=color)
 
-def inline_code(value) -> str:
-    """値をインラインコードで表示(コードブロックと違い、行間に余白ができない)"""
-    return "`" + str(value).replace("`", "´") + "`"
+def code_block(value) -> str:
+    """値をコード枠(```)で表示する。値の中の ``` は枠が壊れないよう置き換える"""
+    return "```" + str(value).replace("```", "´´´") + "```"
 
 def format_stock_item(raw_content: str) -> str:
     result = raw_content.strip()
@@ -823,10 +833,10 @@ async def deliver_items_to_dm(interaction: discord.Interaction, v_id: str, item_
                 proof_desc = (
                     f"**購入者**\n{user_disp}\n"
                     f"**チャンネル**\n{ch_mention}\n"
-                    f"**自販機**\n{inline_code(vm_name)}\n"
-                    f"**商品名**\n{inline_code(item['name'])}\n"
-                    f"**個数**\n{inline_code(qty)}\n"
-                    f"**購入日**\n{inline_code(now_str)}"
+                    f"**自販機**\n{code_block(vm_name)}"
+                    f"**商品名**\n{code_block(item['name'])}"
+                    f"**個数**\n{code_block(qty)}"
+                    f"**購入日**\n{code_block(now_str)}"
                 )
                 proof_embed = discord.Embed(description=proof_desc, color=discord.Color.green())
                 await target_channel.send(embed=proof_embed)
