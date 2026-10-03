@@ -164,6 +164,22 @@ def parse_color(color_hex: str) -> discord.Color:
 # ❌が付いていないエラーメッセージも赤で表示するための目印
 UI_ERROR_WORDS = ("見つかりません", "存在しません", "失敗", "エラー", "できません", "足りません", "不足", "不正", "無効", "大きすぎ")
 
+def bold_text(text: str) -> str:
+    """Embedの本文は通常メッセージより小さく見えるため、各行を太字にして読みやすくする。
+    コードブロック内・空行・見出し/引用/箇条書きの行はそのまま(表示が崩れないように)"""
+    out, in_code = [], False
+    for line in str(text).split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            if stripped.count("```") < 2:   # 1行で閉じていない場合のみ開始/終了を切り替える
+                in_code = not in_code
+            out.append(line)
+        elif in_code or not stripped or stripped.startswith(("#", ">", "- ", "* ")):
+            out.append(line)
+        else:
+            out.append("**" + stripped.replace("**", "") + "**")
+    return "\n".join(out)
+
 def ui_embed(text, color=None) -> discord.Embed:
     """スラッシュコマンドの返信を、自販機パネルと同じEmbed(緑)形式で表示する。エラーは赤、⚠️はオレンジ"""
     text = str(text)
@@ -177,7 +193,7 @@ def ui_embed(text, color=None) -> discord.Embed:
             color = discord.Color.red()
         else:
             color = discord.Color.green()
-    return discord.Embed(description=text[:4096], color=color)
+    return discord.Embed(description=bold_text(text)[:4096], color=color)
 
 def inline_code(value) -> str:
     """値をインラインコードで表示(コードブロックと違い、行間に余白ができない)"""
@@ -931,7 +947,7 @@ class PayPayPaymentModal(discord.ui.Modal, title="PayPay決済"):
                 return
 
             calc_result = (self.unit_price * self.qty) - sent_amount
-            confirm_str = f"`{self.unit_price}×{self.qty}-{sent_amount}={calc_result}`"
+            confirm_str = f"```\n{self.unit_price}×{self.qty}-{sent_amount}={calc_result}\n```"
 
             view = PayPayConfirmView(
                 v_id=self.v_id,
@@ -942,7 +958,8 @@ class PayPayPaymentModal(discord.ui.Modal, title="PayPay決済"):
                 sent_amount=sent_amount
             )
 
-            await interaction.followup.send(embed=ui_embed(confirm_str), view=view, ephemeral=True)
+            # 計算式はEmbedだと小さく表示されるため、コード枠(```)の通常メッセージで送る
+            await interaction.followup.send(confirm_str, view=view, ephemeral=True)
 
         except PayPayLoginError:
             await interaction.followup.send(embed=ui_embed("❌ 認証情報の完全自動更新に失敗しました。`/paypay_login` で1度再ログインしてください。"), ephemeral=True)
@@ -1034,7 +1051,7 @@ class QuantityCouponModal(discord.ui.Modal, title="個数とクーポン入力")
                 discount = c_info["amount"]
 
         final_price = max(0, base_total - discount)
-        calc_str = f"`{unit_price}×{qty}-{discount}={final_price}`"
+        calc_str = f"```\n{unit_price}×{qty}-{discount}={final_price}\n```"
 
         view = ConfirmPurchaseView(
             v_id=self.v_id,
@@ -1045,7 +1062,8 @@ class QuantityCouponModal(discord.ui.Modal, title="個数とクーポン入力")
             unit_price=unit_price
         )
 
-        await interaction.response.send_message(embed=ui_embed(calc_str), view=view, ephemeral=True)
+        # 計算式はEmbedだと小さく表示されるため、コード枠(```)の通常メッセージで送る
+        await interaction.response.send_message(calc_str, view=view, ephemeral=True)
 
 class PaymentSelect(discord.ui.Select):
     def __init__(self, v_id: str, item_id: str):
@@ -2229,7 +2247,7 @@ async def list_vending_machines(interaction: discord.Interaction):
         if infinite_kinds:
             line += f" / 無限商品: {infinite_kinds}種"
         lines.append(line)
-    await send_in_chunks(interaction, lines)
+    await send_in_chunks(interaction, [f"🏪 **自販機一覧** (全{len(vending_machines)}台)"] + lines)
 
 @bot.tree.command(name="商品一覧", description="自販機の商品を一覧表示します")
 @app_commands.describe(vending_machine_id="商品を確認する自販機")
