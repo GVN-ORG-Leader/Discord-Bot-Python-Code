@@ -1,5 +1,0 @@
-discord.py
-requests
-Flask
-pymongo
-dnspython
